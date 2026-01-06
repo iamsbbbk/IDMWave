@@ -1,14 +1,122 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# 引入底层驱动
+import numpy as np
+# 引入底层驱动 (请确保 backprop.py 在同一目录下)
 from backprop import RevModule, RevBackProp
-# 引入创新频域模块
-from model_wave import DWT, IWT, WaveBlock
 
 
 # ==============================================================================
-# 1. 物理测量算子 (Measurement Operator)
+# 1. 增强型基础组件 (RCAB & Learnable Wavelet)
+# ==============================================================================
+
+class ChannelAttention(nn.Module):
+    """
+    通道注意力机制：让网络学会“看哪里”
+    """
+
+    def __init__(self, num_feat, reduction=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        # 确保中间通道数至少为1
+        mid_channels = max(1, num_feat // reduction)
+        self.fc = nn.Sequential(
+            nn.Conv2d(num_feat, mid_channels, 1, padding=0, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, num_feat, 1, padding=0, bias=True),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = self.fc(y)
+        return x * y
+
+
+class RCAB(nn.Module):
+    """
+    [Upgrade] 替代 ResnetBlock。
+    包含 Residual Channel Attention，是提升 PSNR 的关键。
+    """
+
+    def __init__(self, in_c, out_c=None, reduction=16):
+        super().__init__()
+        out_c = in_c if out_c is None else out_c
+
+        self.body = nn.Sequential(
+            nn.Conv2d(in_c, out_c, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_c, out_c, 3, 1, 1),
+            ChannelAttention(out_c, reduction=reduction)
+        )
+        # 如果通道数改变，需要 shortcut 投影
+        self.shortcut = nn.Conv2d(in_c, out_c, 1) if in_c != out_c else nn.Identity()
+
+    def forward(self, x):
+        res = self.body(x)
+        return res + self.shortcut(x)
+
+
+def init_wavelet_filters():
+    """初始化 Haar 小波核"""
+    w_ll = np.array([[0.5, 0.5], [0.5, 0.5]])
+    w_lh = np.array([[-0.5, -0.5], [0.5, 0.5]])
+    w_hl = np.array([[-0.5, 0.5], [-0.5, 0.5]])
+    w_hh = np.array([[0.5, -0.5], [-0.5, 0.5]])
+    weights = np.stack([w_ll, w_lh, w_hl, w_hh], axis=0)  # (4, 2, 2)
+    weights = np.expand_dims(weights, axis=1)  # (4, 1, 2, 2)
+    return torch.from_numpy(weights).float()
+
+
+class LearnableDWT(nn.Module):
+    """[Upgrade] 可学习的小波分解"""
+
+    def __init__(self, in_channels):
+        super().__init__()
+        self.in_channels = in_channels
+        # 初始化为 Haar，但允许梯度更新 (requires_grad=True)
+        base_filter = init_wavelet_filters()
+        self.filters = nn.Parameter(base_filter.repeat(in_channels, 1, 1, 1), requires_grad=True)
+
+    def forward(self, x):
+        # Depthwise Conv 实现每个通道独立的小波变换
+        return F.conv2d(x, self.filters, stride=2, groups=self.in_channels)
+
+
+class LearnableIWT(nn.Module):
+    """[Upgrade] 可学习的小波重构"""
+
+    def __init__(self, in_channels):
+        super().__init__()
+        self.in_channels = in_channels
+        base_filter = init_wavelet_filters()
+        self.filters = nn.Parameter(base_filter.repeat(in_channels, 1, 1, 1), requires_grad=True)
+
+    def forward(self, x):
+        return F.conv_transpose2d(x, self.filters, stride=2, groups=self.in_channels)
+
+
+class WaveBlock(nn.Module):
+    """在小波域进行处理的模块"""
+
+    def __init__(self, in_c):
+        super().__init__()
+        # 小波分解后通道数变4倍，处理后再变回来
+        # 这里我们只处理高频部分或者整体处理
+        self.dwt = LearnableDWT(in_c)
+        self.conv = RCAB(in_c * 4)  # 在频域使用 RCAB
+        self.iwt = LearnableIWT(in_c)
+
+    def forward(self, x):
+        skip = x
+        x = self.dwt(x)
+        x = self.conv(x)
+        x = self.iwt(x)
+        return x + skip
+
+
+# ==============================================================================
+# 2. 物理测量算子
 # ==============================================================================
 class MeasurementOperator(nn.Module):
     def __init__(self, cs_ratio, block_size=32):
@@ -20,6 +128,8 @@ class MeasurementOperator(nn.Module):
         self.AT_conv = nn.Conv2d(m, n, kernel_size=1, bias=False)
         self.ps = nn.PixelShuffle(block_size)
         nn.init.orthogonal_(self.A.weight)
+        # 冻结测量矩阵通常能稳定训练，或者设为 True 联合优化
+        self.A.weight.requires_grad = True
 
     def forward(self, x):
         return self.A(x)
@@ -30,37 +140,47 @@ class MeasurementOperator(nn.Module):
 
 
 # ==============================================================================
-# 2. 基础组件 (含显存优化版 Attention)
+# 3. 注入器与 Attention (优化版)
 # ==============================================================================
 
-class ResnetBlock(nn.Module):
-    def __init__(self, in_c, out_c=None):
+class ChannelWiseInjector(nn.Module):
+    """
+    [Upgrade] 通道级注入器。
+    相比原来的标量 scale，这里每个通道有独立的步长，优化更精细。
+    """
+
+    def __init__(self, channels, operator, downscale_factor):
         super().__init__()
-        out_c = in_c if out_c is None else out_c
-        self.norm1 = nn.GroupNorm(min(32, in_c), in_c)  # 安全的 GroupNorm
-        self.conv1 = nn.Conv2d(in_c, out_c, 3, padding=1)
-        self.norm2 = nn.GroupNorm(min(32, out_c), out_c)
-        self.conv2 = nn.Conv2d(out_c, out_c, 3, padding=1)
-        self.act = nn.SiLU()
-        self.shortcut = nn.Conv2d(in_c, out_c, 1) if in_c != out_c else nn.Identity()
+        self.operator = operator
+        self.r = downscale_factor
+        target_c = self.r * self.r
+
+        self.f2i_conv = nn.Conv2d(channels, target_c, 1)
+        self.ps = nn.PixelShuffle(self.r)
+        self.pus = nn.PixelUnshuffle(self.r)
+        self.i2f_conv = nn.Conv2d(target_c, channels, 1)
+
+        # [Upgrade] 这里的 scale 是 (1, C, 1, 1)
+        self.scale = nn.Parameter(torch.zeros(1, channels, 1, 1))
 
     def forward(self, x):
-        h = self.conv1(self.act(self.norm1(x)))
-        h = self.conv2(self.act(self.norm2(h)))
-        return h + self.shortcut(x)
+        # 1. 映射到图像空间
+        img_proxy = self.ps(self.f2i_conv(x))
+        # 2. 物理一致性计算: A^T(y - Ax)
+        y_hat = self.operator(img_proxy)
+        proj_back = self.operator.transpose(y_hat)
+        # 3. 映射回特征空间
+        feat_update = self.i2f_conv(self.pus(proj_back))
+        # 4. 梯度更新
+        return x + self.scale * feat_update
 
 
-class AttentionBlock(nn.Module):
-    """
-    [Optimization] 线性高效注意力模块 (Linear Efficient Attention)
-    替代原本的 O(N^2) Dot-Product Attention。
-    利用结合律 Q(K^T V) 代替 (QK^T)V，将显存消耗从 32GB 降至 <10MB。
-    """
+class EfficientAttention(nn.Module):
+    """保持原有的显存高效 Attention，但加入 GroupNorm 稳定训练"""
 
     def __init__(self, channels):
         super().__init__()
         self.norm = nn.GroupNorm(min(32, channels), channels)
-        # qkv 映射保持不变
         self.qkv = nn.Conv2d(channels, channels * 3, 1)
         self.proj = nn.Conv2d(channels, channels, 1)
 
@@ -72,66 +192,23 @@ class AttentionBlock(nn.Module):
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=1)
 
-        # 变形为 (B, C, N) 其中 N = H*W
         q = q.reshape(B, C, H * W)
         k = k.reshape(B, C, H * W)
         v = v.reshape(B, C, H * W)
 
-        # [Key Trick]: 对 Spatial 维度进行 Softmax，而不是像传统 Attention 那样对 N*N 矩阵做
-        # 这样可以将 K 当作一种全局上下文权重的分布
         q = q.softmax(dim=-1)
         k = k.softmax(dim=-1)
+        q = q * (C ** -0.5)
 
-        # 归一化因子 (防止梯度消失)
-        scale = C ** -0.5
-        q = q * scale
-
-        # [Linear Attention Magic]
-        # 1. 先计算全局上下文矩阵 (Global Context Matrix)
-        # k: (B, C, N), v: (B, C, N)
-        # context = k @ v.T -> (B, C, C)
-        # 这个矩阵大小只有 C*C (例如 32*32)，非常非常小
         context = torch.bmm(k, v.transpose(1, 2))
-
-        # 2. 将上下文聚合到 Query
-        # q: (B, C, N), context: (B, C, C)
-        # out = context.T @ q -> (B, C, N) (注意转置关系以匹配维度)
-        # 这里其实是 context @ q 的某种变体，等价于 attention 加权
-        out = torch.bmm(context, q)  # 此时 out 是 (B, C, N)，实际上是 v 的加权组合
-
-        # 这种简单的形式可能丢失位置信息，但在 IDM 这种迭代网络中，
-        # 我们主要需要它捕捉全局颜色/亮度统计信息。
-        # 为了数学严谨性，通常使用 Efficient Attention 的变体：
-        # standard: softmax(Q K^T) V
-        # linear approximation: Q (softmax(K)^T V)
-        # 上面的实现是基于 Shen et al. "Efficient Attention" 的简化思路
+        out = torch.bmm(context, q)
 
         out = out.reshape(B, C, H, W)
         return self.proj(out) + x_in
 
 
-class Injector(nn.Module):
-    def __init__(self, channels, operator, downscale_factor):
-        super().__init__()
-        self.operator = operator
-        self.r = downscale_factor
-        target_c = self.r * self.r
-        self.f2i_conv = nn.Conv2d(channels, target_c, 1)
-        self.ps = nn.PixelShuffle(self.r)
-        self.pus = nn.PixelUnshuffle(self.r)
-        self.i2f_conv = nn.Conv2d(target_c, channels, 1)
-        self.scale = nn.Parameter(torch.zeros(1))
-
-    def forward(self, x):
-        img_proxy = self.ps(self.f2i_conv(x))
-        y_hat = self.operator(img_proxy)
-        proj_back = self.operator.transpose(y_hat)
-        feat_update = self.i2f_conv(self.pus(proj_back))
-        return x + self.scale.to(x.dtype) * feat_update
-
-
 # ==============================================================================
-# 3. 核心可逆控制块
+# 4. 核心 IDM 结构
 # ==============================================================================
 class IDMBlock(nn.Module):
     def __init__(self, layers):
@@ -141,51 +218,48 @@ class IDMBlock(nn.Module):
         self.beta = nn.Parameter(torch.zeros(1))
 
     def forward(self, x):
+        # 简单的输入增强
         x_in = torch.cat([x, self.alpha * x], dim=1)
+        # 可逆反向传播
         x_out = RevBackProp.apply(x_in, self.layers)
         x1, x2 = x_out.chunk(2, dim=1)
-        out = x1 + self.beta * x2
-        return out
+        return x1 + self.beta * x2
 
 
-# ==============================================================================
-# 4. U-Net 结构组件
-# ==============================================================================
 class IDMDownBlock(nn.Module):
     def __init__(self, in_c, out_c, operator, level, use_wave=False):
         super().__init__()
 
+        # 下采样策略
         if level > 0:
             self.downsample = nn.Sequential(
-                DWT(in_c),
-                nn.Conv2d(in_c * 4, out_c, 1)
+                LearnableDWT(in_c),  # 使用可学习小波下采样
+                nn.Conv2d(in_c * 4, out_c, 1)  # 降维
             )
             conv_in_needed = False
         else:
             self.downsample = nn.Identity()
             conv_in_needed = True
 
-        if conv_in_needed and (in_c != out_c):
-            self.conv_in = nn.Conv2d(in_c, out_c, 1)
-        else:
-            self.conv_in = nn.Identity()
+        self.conv_in = nn.Conv2d(in_c, out_c, 1) if (conv_in_needed and in_c != out_c) else nn.Identity()
 
         rev_list = []
+        scale = 2 ** level
+
+        # Block 1: Feature Extraction
         if use_wave:
             rev_list.append(RevModule(WaveBlock(out_c), v=0.5))
         else:
-            rev_list.append(RevModule(ResnetBlock(out_c), v=0.5))
+            rev_list.append(RevModule(RCAB(out_c), v=0.5))  # 使用 RCAB
 
-        scale = 2 ** level
-        rev_list.append(RevModule(Injector(out_c, operator, scale), v=0.5))
+        # Block 2: Physics Injection
+        rev_list.append(RevModule(ChannelWiseInjector(out_c, operator, scale), v=0.5))
 
-        if use_wave:
-            pass
-        else:
-            # 现在这里的 AttentionBlock 是显存安全的
-            rev_list.append(RevModule(AttentionBlock(out_c), v=0.5))
+        # Block 3: Global Context
+        rev_list.append(RevModule(EfficientAttention(out_c), v=0.5))
 
-        rev_list.append(RevModule(Injector(out_c, operator, scale), v=0.5))
+        # Block 4: Physics Injection Again
+        rev_list.append(RevModule(ChannelWiseInjector(out_c, operator, scale), v=0.5))
 
         self.idm_processor = IDMBlock(rev_list)
 
@@ -201,25 +275,24 @@ class IDMUpBlock(nn.Module):
         super().__init__()
 
         self.upsample_prep = nn.Conv2d(in_c, out_c * 4, 1)
-        self.iwt = IWT(out_c)
+        self.iwt = LearnableIWT(out_c)  # 使用可学习小波上采样
 
-        # 确保通道对齐
-        merge_in_channels = out_c + skip_c
-        self.conv_merge = nn.Conv2d(merge_in_channels, out_c, 1)
+        self.conv_merge = nn.Conv2d(out_c + skip_c, out_c, 1)
 
         rev_list = []
+        scale = 2 ** level
+
         if use_wave:
             rev_list.append(RevModule(WaveBlock(out_c), v=0.5))
         else:
-            rev_list.append(RevModule(ResnetBlock(out_c), v=0.5))
+            rev_list.append(RevModule(RCAB(out_c), v=0.5))
 
-        scale = 2 ** level
-        rev_list.append(RevModule(Injector(out_c, operator, scale), v=0.5))
+        rev_list.append(RevModule(ChannelWiseInjector(out_c, operator, scale), v=0.5))
 
         if not use_wave:
-            rev_list.append(RevModule(AttentionBlock(out_c), v=0.5))
+            rev_list.append(RevModule(EfficientAttention(out_c), v=0.5))
 
-        rev_list.append(RevModule(Injector(out_c, operator, scale), v=0.5))
+        rev_list.append(RevModule(ChannelWiseInjector(out_c, operator, scale), v=0.5))
 
         self.idm_processor = IDMBlock(rev_list)
 
@@ -229,7 +302,7 @@ class IDMUpBlock(nn.Module):
 
         if skip is not None:
             if x.shape[2:] != skip.shape[2:]:
-                x = F.interpolate(x, size=skip.shape[2:], mode='nearest')
+                x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=False)
             x = torch.cat([x, skip], dim=1)
 
         x = self.conv_merge(x)
@@ -238,7 +311,43 @@ class IDMUpBlock(nn.Module):
 
 
 # ==============================================================================
-# 5. 主模型: IDMWaveUNet
+# 5. FFT 频域模块 (Bottleneck 增强)
+# ==============================================================================
+class FFTBlock(nn.Module):
+    """
+    在 Bottleneck 处使用，捕捉全局频率信息。
+    """
+
+    def __init__(self, channels):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels * 2, channels * 2, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels * 2, channels * 2, 1)
+        )
+
+    def forward(self, x):
+        # Real FFT
+        # x: (B, C, H, W)
+        x_fft = torch.fft.rfft2(x, norm='backward')
+        # Stack real and imag parts: (B, C, H, W/2+1) -> (B, 2C, H, W/2+1)
+        x_real = x_fft.real
+        x_imag = x_fft.imag
+        x_cat = torch.cat([x_real, x_imag], dim=1)
+
+        # Process in freq domain
+        x_cat = self.conv(x_cat)
+
+        # Restore
+        x_real, x_imag = x_cat.chunk(2, dim=1)
+        x_fft_new = torch.complex(x_real, x_imag)
+        x_out = torch.fft.irfft2(x_fft_new, s=x.shape[2:], norm='backward')
+
+        return x + x_out
+
+
+# ==============================================================================
+# 6. 主模型: IDMWaveUNet (Refined)
 # ==============================================================================
 class IDMWaveUNet(nn.Module):
     def __init__(self, cs_ratio=0.1, block_size=32, base_dim=64):
@@ -252,11 +361,12 @@ class IDMWaveUNet(nn.Module):
         self.down1 = IDMDownBlock(base_dim, base_dim * 2, self.operator, level=1, use_wave=True)
         self.down2 = IDMDownBlock(base_dim * 2, base_dim * 4, self.operator, level=2, use_wave=True)
 
-        # Bottleneck
+        # Bottleneck [Enhanced with FFT]
+        # 混合使用 WaveBlock, RCAB 和 FFTBlock
         mid_layers = [
             RevModule(WaveBlock(base_dim * 4), v=0.5),
-            RevModule(WaveBlock(base_dim * 4), v=0.5),
-            RevModule(ResnetBlock(base_dim * 4), v=0.5)
+            RevModule(FFTBlock(base_dim * 4), v=0.5),  # 新增：FFT 全局感知
+            RevModule(RCAB(base_dim * 4), v=0.5)  # 替换了原来的 ResnetBlock
         ]
         self.mid_block = IDMBlock(mid_layers)
 
@@ -272,78 +382,76 @@ class IDMWaveUNet(nn.Module):
         self.tail_act = nn.SiLU()
         self.tail_conv = nn.Conv2d(base_dim, 1, 3, padding=1)
 
+        # 最后的精修模块 (Refine Module)
+        self.refine = nn.Sequential(
+            nn.Conv2d(1, 16, 3, 1, 1),
+            RCAB(16, reduction=4),
+            nn.Conv2d(16, 1, 3, 1, 1)
+        )
+
     def forward(self, x_gt):
+        # 1. 采样与初始重建
         y = self.operator(x_gt)
         x_init = self.operator.transpose(y)
 
+        # 2. Deep Feature Extraction
         h = self.head_conv(x_init)
 
+        # Encoder
         h0, s0 = self.down0(h)
         h1, s1 = self.down1(h0)
         h2, s2 = self.down2(h1)
 
+        # Bottleneck
         h_mid = self.mid_block(h2)
 
+        # Decoder
         u2 = self.up2(h_mid, s2)
         u1 = self.up1(u2, s1)
         u0 = self.up0(u1, s0)
 
-        out = self.tail_conv(self.tail_act(self.tail_norm(u0)))
-        return x_init + out, y
+        # 3. 输出
+        res = self.tail_conv(self.tail_act(self.tail_norm(u0)))
+        x_pre = x_init + res
+
+        # 4. 额外的精修步骤 (Optional, but helps PSNR)
+        x_final = self.refine(x_pre) + x_pre
+
+        return x_final, y
 
 
+# ==============================================================================
+# 测试代码
+# ==============================================================================
 if __name__ == "__main__":
     import time
 
-
-    # 兼容性工具
-    def get_autocast_context():
-        if hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast'):
-            return torch.amp.autocast(device_type='cuda', enabled=True)
-        else:
-            from torch.cuda.amp import autocast
-            return autocast(enabled=True)
-
-
-    try:
-        from torch.amp import GradScaler
-    except ImportError:
-        from torch.cuda.amp import GradScaler
-
     if not torch.cuda.is_available():
-        print("Error: CUDA required for this test.")
-        exit(0)
+        print("CUDA required for test.")
+        exit()
 
     device = torch.device('cuda')
-    print(f"Running IDMWave Model Test on {device}...")
+    # 使用 64 dim 以匹配训练设置
+    model = IDMWaveUNet(cs_ratio=0.1, block_size=32, base_dim=64).to(device)
 
-    # 使用较小的 base_dim 进行测试，确保即使显存很少也能跑通
-    model = IDMWaveUNet(cs_ratio=0.1, block_size=32, base_dim=32).to(device)
+    print("Model initialized.")
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Total Parameters: {param_count / 1e6:.2f} M")
 
     x = torch.randn(2, 1, 256, 256).to(device)
-    scaler = GradScaler()
 
+    # 测试前向
     try:
-        start_time = time.time()
+        out, y = model(x)
+        print(f"Forward success. Output: {out.shape}")
 
-        with get_autocast_context():
-            recon, y = model(x)
-            loss = F.mse_loss(recon, x)
-
-        end_time = time.time()
-
-        print(f"Forward pass successful!")
-        print(f"Input: {x.shape}, Output: {recon.shape}")
-        print(f"Time: {end_time - start_time:.4f}s")
-        print(f"Loss: {loss.item():.6f}")
-
-        scaler.scale(loss).backward()
-        print("Backward pass successful! (Gradients computed)")
+        # 测试反向 (验证 RevModule 是否正常)
+        loss = out.mean()
+        loss.backward()
+        print("Backward success.")
 
     except Exception as e:
-        print(f"FAILED: {e}")
+        print(f"Error: {e}")
         import traceback
 
         traceback.print_exc()
